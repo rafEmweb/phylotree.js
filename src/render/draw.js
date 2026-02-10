@@ -9,9 +9,11 @@ import * as clades from "./clades";
 import * as render_nodes from "./nodes";
 import * as render_edges from "./edges";
 import * as events from "./events";
-import { css_classes } from "./options";
+import { css_classes, initializeCssClasses } from "./options";
 import * as opt from "./options";
 import * as menus from "./menus";
+import * as eventEmitter from "./event-emitter";
+import * as selectionSets from "./selection-sets";
 
 // replacement for d3.functor
 function constant(x) {
@@ -22,6 +24,7 @@ function constant(x) {
 
 class TreeRender {
   constructor(phylotree, options = {}) {
+    initializeCssClasses(options['css-classes']);
     this.css_classes = css_classes;
     this.phylotree = phylotree;
     this.container = options.container;
@@ -32,6 +35,7 @@ class TreeRender {
     this._nodeLabel = this.defNodeLabel;
     this.svg = null;
     this._selectionCallback = null;
+    this._eventListeners = {};
     this.scales = [1, 1];
     this.size = [1, 1];
     this.fixed_width = [14, 30];
@@ -100,7 +104,13 @@ class TreeRender {
       "show-labels": true,
       "node-styler": null,
       "edge-styler": null,
-      "node-span": null
+      "node-span": null,
+      "responsive": false,
+      "preserve-aspect-ratio": "xMidYMid meet",
+      "selection-mode": "single",
+      "selection-sets": [],
+      "initial-selection": [],
+      "initial-sets": {}
     };
 
     this.ensure_size_is_in_px = function(value) {
@@ -118,6 +128,10 @@ class TreeRender {
 
     this.node_styler = this.options['node-styler'];
     this.edge_styler = this.options['edge-styler'];
+
+    // Store zoom state to preserve across updates
+    this.currentZoomTransform = null;
+    this.baseTransform = { x: 0, y: 0 };
 
     this.nodeSpan = this.options['node-span'];
 
@@ -142,6 +156,37 @@ class TreeRender {
     this.initializeEdgeLabels();
     this.update();
     events.d3PhylotreeAddEventListener();
+
+    // Initialize multi-set selection if configured
+    if (this.options["selection-mode"] === "multi-set" &&
+        this.options["selection-sets"].length > 0) {
+      this.initializeSelectionSets(this.options["selection-sets"]);
+    }
+
+    // Apply initial selection if configured
+    this.applyInitialSelection();
+  }
+
+  /**
+   * Apply initial selection from render options.
+   * @private
+   */
+  applyInitialSelection() {
+    // Single selection mode
+    if (this.options["initial-selection"] &&
+        this.options["initial-selection"].length > 0) {
+      this.selectNodes(this.options["initial-selection"]);
+    }
+
+    // Multi-set mode
+    if (this.options["selection-mode"] === "multi-set" &&
+        this.options["initial-sets"]) {
+      Object.entries(this.options["initial-sets"]).forEach(([setName, nodeNames]) => {
+        nodeNames.forEach(nodeName => {
+          this.addToSet(nodeName, setName);
+        });
+      });
+    }
   }
 
   pad_height() {
@@ -209,10 +254,22 @@ class TreeRender {
         .select("svg")
         .remove();
 
-      this.svg = d3
-        .create("svg")
-        .attr("width", this.width)
-        .attr("height", this.height);
+      this.svg = d3.create("svg");
+
+      if (this.options["responsive"]) {
+        // Responsive mode: use viewBox for scaling
+        this.svg
+          .attr("viewBox", `0 0 ${this.width} ${this.height}`)
+          .attr("preserveAspectRatio", this.options["preserve-aspect-ratio"])
+          .style("width", "100%")
+          .style("height", "auto")
+          .style("max-width", "100%");
+      } else {
+        // Fixed mode: explicit width/height
+        this.svg
+          .attr("width", this.width)
+          .attr("height", this.height);
+      }
 
       this.set_size([this.height, this.width]);
 
@@ -260,6 +317,10 @@ class TreeRender {
 
     this.placenodes();
 
+    // Sync edge labels BEFORE drawing edges so that edge.selected reflects node.selected
+    // This is critical for custom edge stylers that rely on selection state
+    this.syncEdgeLabels();
+
     transitions = this.transitions(transitions);
 
     let node_id = 0;
@@ -268,15 +329,26 @@ class TreeRender {
       .selectAll("." + css_classes["tree-container"])
       .data([0]);
 
+    // Store base transform for composition with zoom
+    this.baseTransform = {
+      x: this.offsets[1] + this.options["left-offset"],
+      y: this.pad_height()
+    };
+
     enclosure = enclosure
       .enter()
       .append("g")
       .attr("class", css_classes["tree-container"])
       .merge(enclosure)
       .attr("transform", d => {
+        // Compose base transform with current zoom transform if present
+        if (this.currentZoomTransform && this.options["zoom"]) {
+          const zt = this.currentZoomTransform;
+          return `translate(${zt.x + this.baseTransform.x * zt.k}, ${zt.y + this.baseTransform.y * zt.k}) scale(${zt.k})`;
+        }
         return this.d3PhylotreeSvgTranslate([
-          this.offsets[1] + this.options["left-offset"],
-          this.pad_height()
+          this.baseTransform.x,
+          this.baseTransform.y
         ]);
       });
 
@@ -426,30 +498,43 @@ class TreeRender {
       brush.call(brush_object);
     }
 
-    this.syncEdgeLabels();
+    // Note: syncEdgeLabels() is called at the start of update() before edges are drawn
+    // to ensure selection state is synced before reclassEdge and edge_styler run
 
     if (this.options["zoom"]) {
-      let zoom = d3
-        .zoom()
-        .scaleExtent([0.1, 10])
-        .on("zoom", (event) => {
+      // Create zoom behavior if not already created
+      if (!this.zoomBehavior) {
+        this.zoomBehavior = d3
+          .zoom()
+          .scaleExtent([0.1, 10])
+          .on("zoom", (event) => {
+            // Store the current zoom transform
+            this.currentZoomTransform = event.transform;
 
-          d3.select("." + css_classes["tree-container"]).attr("transform", d => {
-            let toTransform = event.transform;
-            return toTransform;
+            // Compose zoom transform with base transform
+            const zt = event.transform;
+            const composedTransform = `translate(${zt.x + this.baseTransform.x * zt.k}, ${zt.y + this.baseTransform.y * zt.k}) scale(${zt.k})`;
+
+            // Use this.svg.select() to target only this tree instance (not global d3.select)
+            this.svg.select("." + css_classes["tree-container"]).attr("transform", composedTransform);
+
+            // Apply same transform to scale bar
+            this.svg.select("." + css_classes["tree-scale-bar"]).attr("transform", d => {
+              return `translate(${zt.x + this.baseTransform.x * zt.k}, ${zt.y + (this.baseTransform.y - 10) * zt.k}) scale(${zt.k})`;
+            });
           });
+      }
 
-          // Give some extra room
-          d3.select("." + css_classes["tree-scale-bar"]).attr("transform", d => {
-            let toTransform = event.transform;
-            toTransform.y -= 10; 
-            return toTransform;
-          });
-          
-        });
+      this.svg.call(this.zoomBehavior);
 
-      this.svg.call(zoom);
+      // Restore zoom transform if we have one stored (preserves zoom across updates)
+      if (this.currentZoomTransform) {
+        this.svg.call(this.zoomBehavior.transform, this.currentZoomTransform);
+      }
     }
+
+    // Emit rendered event
+    this.emit('rendered');
 
     return this;
   }
@@ -974,7 +1059,7 @@ class TreeRender {
       this.size[0] = this.radial_center + this.radius / scaler;
       this.size[1] = this.radial_center + this.radius / scaler;
     } else {
-this.do_lr();
+      this.do_lr();
 
       this.draw_branch = draw_line;
       this.edge_placer = lineSegmentPlacer;
@@ -985,8 +1070,10 @@ this.do_lr();
         d.x *= this.scales[0];
         d.y *= this.scales[1]*.8;
 
-        if (this.options["layout"] == "right-to-left") {   
-          d.y = this._extents[1][1] * this.scales[1] - d.y;
+        if (this.options["layout"] == "right-to-left") {
+          // For RTL, always add label_width offset to shift tree right,
+          // creating space on the left for labels (prevents labels overlapping branches)
+          d.y = this._extents[1][1] * this.scales[1] - d.y + this.label_width;
         }
 
 
@@ -1363,5 +1450,7 @@ _.extend(TreeRender.prototype, render_edges);
 _.extend(TreeRender.prototype, events);
 _.extend(TreeRender.prototype, menus);
 _.extend(TreeRender.prototype, opt);
+_.extend(TreeRender.prototype, eventEmitter);
+_.extend(TreeRender.prototype, selectionSets);
 
 export default TreeRender;

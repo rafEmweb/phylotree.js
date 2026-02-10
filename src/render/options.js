@@ -18,6 +18,12 @@ export const css_classes = {
   node_text: "phylotree-node-text"
 };
 
+export function initializeCssClasses(classes = {}) {
+  Object.keys(classes).forEach(key => {
+    css_classes[key] = classes[key]
+  })
+}
+
 export function internalNames(attr) {
   if (!arguments.length) return this.options["internal-names"];
   this.options["internal-names"] = attr;
@@ -55,19 +61,7 @@ export function nodeBubbleSize(node) {
     }
 }
 
-export function shiftTip(d) {
-  if (this.options["is-radial"]) {
-    return [
-      (d.text_align == "end" ? -1 : 1) *
-        (this.radius_pad_for_bubbles - d.radius),
-      0
-    ];
-  }
-  if (this.options["right-to-left"]) {
-    return [this.right_most_leaf - d.screen_x, 0];
-  }
-  return [this.right_most_leaf - d.screen_x, 0];
-}
+// shiftTip function is defined in nodes.js - removed duplicate here
 
 export function layoutHandler(attr) {
   if (!arguments.length) return this.layout_listener_handler;

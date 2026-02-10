@@ -14,8 +14,10 @@ export function shiftTip(d) {
     ];
   }
 
-  if (this.options["right-to-left"]) {
-    return [this.right_most_leaf - d.screen_x, 0];
+  if (this.options["layout"] == "right-to-left") {
+    // For RTL, shift labels to align at the left edge (x=0)
+    // screen_x is the node's horizontal position; shifting by -screen_x moves label to x=0
+    return [-d.screen_x, 0];
   }
 
   return [this.right_most_leaf - d.screen_x, 0];
@@ -41,8 +43,12 @@ export function drawNode(container, node, transitions) {
       .append("text")
       .classed(this.css_classes["node_text"], true)
       .merge(labels)
-      .on("click", d=> {
-        this.handle_node_click(node, d);
+      .on("click", (event, d) => {
+        this.emit('nodeClick', node, event);
+        this.handle_node_click(node, event);
+      })
+      .on("mouseenter", (event) => {
+        this.emit('nodeHover', node, event);
       })
       .attr("dy", d => {
         return this.shown_font_size * 0.33;
@@ -68,18 +74,27 @@ export function drawNode(container, node, transitions) {
           return d.text_align;
         });
     } else {
-      labels = labels.attr("text-anchor", "start").attr("transform", d => {
-        if (this.options["layout"] == "right-to-left") {
-          return this.d3PhylotreeSvgTranslate([-20, 0]);
-        }
-        return this.d3PhylotreeSvgTranslate(
-          this.alignTips() ? this.shiftTip(d) : null
-        );
-      });
+      const isRTL = this.options["layout"] == "right-to-left";
+      labels = labels
+        .attr("text-anchor", isRTL ? "end" : "start")
+        .attr("transform", d => {
+          return this.d3PhylotreeSvgTranslate(
+            this.alignTips() ? this.shiftTip(d) : null
+          );
+        });
     }
 
     if (this.alignTips()) {
       tracers = tracers.data([node]);
+      const isRTL = this.options["layout"] == "right-to-left";
+
+      // Determine direction multiplier for tracer start position
+      const getX1Direction = (d) => {
+        if (this.radial()) {
+          return d.text_align == "end" ? -1 : 1;
+        }
+        return isRTL ? -1 : 1;
+      };
 
       if (transitions) {
         tracers = tracers
@@ -88,27 +103,12 @@ export function drawNode(container, node, transitions) {
           .classed(this.css_classes["branch-tracer"], true)
           .merge(tracers)
           .attr("x1", d => {
-            return (
-              (d.text_align == "end" ? -1 : 1) * this.nodeBubbleSize(node)
-            );
+            return getX1Direction(d) * this.nodeBubbleSize(node);
           })
           .attr("x2", 0)
           .attr("y1", 0)
           .attr("y2", 0)
           .attr("x2", d => {
-            if (this.options["layout"] == "right-to-left") {
-              return d.screen_x;
-            }
-
-            return this.shiftTip(d)[0];
-          })
-          .attr("transform", d => {
-            return this.d3PhylotreeSvgRotate(d.text_angle);
-          })
-          .attr("x2", d => {
-            if (this.options["layout"] == "right-to-left") {
-              return d.screen_x;
-            }
             return this.shiftTip(d)[0];
           })
           .attr("transform", d => {
@@ -121,9 +121,7 @@ export function drawNode(container, node, transitions) {
           .classed(this.css_classes["branch-tracer"], true)
           .merge(tracers)
           .attr("x1", d => {
-            return (
-              (d.text_align == "end" ? -1 : 1) * this.nodeBubbleSize(node)
-            );
+            return getX1Direction(d) * this.nodeBubbleSize(node);
           })
           .attr("y2", 0)
           .attr("y1", 0)
@@ -153,17 +151,24 @@ export function drawNode(container, node, transitions) {
       });
 
       if (this.shown_font_size >= 5) {
+        const isRTL = this.options["layout"] == "right-to-left";
         labels = labels.attr("dx", d => {
-          return (
-            (d.text_align == "end" ? -1 : 1) *
-            ((this.alignTips() ? 0 : shift) + this.shown_font_size * 0.33)
-          );
+          // For radial, use text_align; for linear RTL, use negative offset; otherwise positive
+          const direction = this.radial()
+            ? (d.text_align == "end" ? -1 : 1)
+            : (isRTL ? -1 : 1);
+          return direction * ((this.alignTips() ? 0 : shift) + this.shown_font_size * 0.33);
         });
       }
     } else {
       if (this.shown_font_size >= 5) {
+        const isRTL = this.options["layout"] == "right-to-left";
         labels = labels.attr("dx", d => { // eslint-disable-line
-          return (d.text_align == "end" ? -1 : 1) * this.shown_font_size * 0.33;
+          // For radial, use text_align; for linear RTL, use negative offset; otherwise positive
+          const direction = this.radial()
+            ? (d.text_align == "end" ? -1 : 1)
+            : (isRTL ? -1 : 1);
+          return direction * this.shown_font_size * 0.33;
         });
       }
     }
@@ -183,8 +188,12 @@ export function drawNode(container, node, transitions) {
         .attr("r", d => {
           return Math.min(this.shown_font_size * 0.75, radius);
         })
-        .on("click", d => {
-          this.handle_node_click(node, d);
+        .on("click", (event, d) => {
+          this.emit('nodeClick', node, event);
+          this.handle_node_click(node, event);
+        })
+        .on("mouseenter", (event) => {
+          this.emit('nodeHover', node, event);
         });
     } else {
       circles.remove();
@@ -348,7 +357,7 @@ export function defNodeLabel(_node) {
 export function nodeLabel(attr) {
   if (!arguments.length) return this._nodeLabel;
   this._nodeLabel = attr ? attr : defNodeLabel;
-	this.update();
+  this.update();
   return this;
 }
 
